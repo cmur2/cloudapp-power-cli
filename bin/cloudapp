@@ -1,0 +1,506 @@
+#!/usr/bin/env ruby
+# -*- coding: utf-8 -*-
+
+require 'date'
+require 'optparse'
+require 'uri'
+require 'yaml'
+
+require 'rubygems'
+require 'cloudapp_api'
+
+LIST_TIME_FMT = '%d.%m.%y %H:%M'
+VIEW_TIME_FMT = '%d. %b %Y %H:%M:%S'
+ACC_TIME_FMT = VIEW_TIME_FMT
+
+ITEM_TYPES = [:image, :bookmark, :text, :archive, :audio, :video, :unknown]
+
+# just a guess to make output format prettier
+HASH_LENGTH = 10
+
+# low level errors
+LOW_ERRORS = [
+  #TimeoutError, EOFError, Errno::ETIMEDOUT, Errno::ECONNREFUSED,
+  Errno::EPIPE, Errno::EINVAL
+]
+
+module CloudApp
+  class Drop
+    def slug
+      url.split(/\//).last
+    end
+    
+    # patch for cloudapp_api supporting custom domains
+    def self.find(id)
+      res = get "http://#{$domain}/#{id}"
+      res.ok? ? Drop.new(res) : bad_response(res)
+    end
+  end
+end
+
+class Module
+  def subclasses
+    classes = []
+    ObjectSpace.each_object do |klass|
+      next unless Module === klass
+      classes << klass if self > klass
+    end
+    classes
+  end
+end
+
+class String
+  def json2time
+    # offset should be zero since this is assumed to be UTC
+    dt = DateTime.strptime(self, "%Y-%m-%dT%H:%M:%SZ")
+    Time.utc(dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec)
+    # "2011-09-24T08:49:14Z"
+  end
+  
+  def localtime
+    json2time.localtime
+  end
+  
+  def json2fmtlocaltime(fmt)
+    json2time.localtime.strftime(fmt)
+  end
+end
+
+class Time
+  # HACK: this is a hack to ensure older httparty then 0.8.0 will work too
+  def json2fmtlocaltime(fmt)
+    localtime.strftime(fmt)
+  end
+end
+
+def args?(n=2)
+  if ARGV.length < n
+    puts @opts
+    abort "Wrong number of arguments given!"
+  end
+end
+
+# only use bold colors (1;) for those on black on white screens
+def cyan;  if @options[:colors]; "\e[1;36m" else "" end end
+def green; if @options[:colors]; "\e[1;32m" else "" end end
+def red;   if @options[:colors]; "\e[1;31m" else "" end end
+def rst;   if @options[:colors]; "\e[0m" else "" end end
+
+def print_long(drop)
+  list_flags = ''
+  if drop.private;          list_flags += [green, 'p', rst].join else list_flags += '-' end
+  if !drop.deleted_at.nil?; list_flags += [red, 'd', rst].join else list_flags += '-' end
+  if not drop.redirect_url.nil?
+    list_name =  ["-> ", cyan, drop.redirect_url, rst].join
+    # prepend the drop's name, if it's different from the url
+    # (which should only happen if you specify it by hand)
+    list_name = [cyan, drop.name, rst, " ", list_name].join if drop.name != drop.redirect_url
+  elsif drop.item_type == 'image'
+    list_name = [green, drop.name, rst].join
+  else
+    list_name = drop.name
+  end
+  format("%-#{HASH_LENGTH}s %s %-9s %-10s %-#{8 + $domain.length + HASH_LENGTH}s %s",
+    drop.slug, list_flags, drop.item_type,
+    drop.updated_at.json2fmtlocaltime(LIST_TIME_FMT),
+    drop.url, list_name)
+end
+
+def fetch(url, limit = 3)
+  raise ArgumentError, 'HTTP redirection too deep' if limit == 0
+
+  response = Net::HTTP.get_response(URI.parse(url))
+  case response
+  when Net::HTTPSuccess     then response
+  when Net::HTTPRedirection then fetch(response['location'], limit-1)
+  else response.error! end
+end
+
+def load_config
+  if @options.key?(:creds)
+    u,p = @options[:creds].split(':')
+    return {'username' => u, 'password' => p}
+  end
+  if !File.exists?($config_file)
+    abort "Login required! Please save your login via ´login´ or use ´-u´ option."
+  end
+  YAML.load_file($config_file)
+end
+
+def save_config(config)
+  if File.exists?($config_file)
+    config = YAML.load_file($config_file).merge(config)
+  end
+  File.open($config_file, 'w+') do |f| YAML.dump(config, f) end
+end
+
+def load_service_url
+  return @options[:service_url] if @options.key?(:service_url)
+  if File.exists?($config_file)
+    config = YAML.load_file($config_file)
+    return config['service_url'] if config['service_url']
+  end
+  "http://my.cl.ly"
+end
+
+# main starts here
+
+@options = {:colors => true}
+
+@opts = OptionParser.new do |opts|
+  opts.banner =  "Usage: cloudapp [options] command [arguments]\n\n"
+  opts.banner += "Commands:\n"
+  opts.banner += "    register USERNAME PASSWORD\n"
+  opts.banner += "    login [USERNAME] [PASSWORD]\n"
+  opts.banner += "    service [URL]\n"
+  opts.banner += "    change (username|password|privacy) NEWVALUE\n"
+  opts.banner += "    account\n"
+  opts.banner += "    list\n"
+  opts.banner += "    upload FILE\n"
+  opts.banner += "    bookmark [NAME] LINK\n"
+  opts.banner += "    download SLUG\n"
+  opts.banner += "    view SLUG\n"
+  opts.banner += "    delete SLUG\n"
+  opts.banner += "    recover SLUG\n"
+  opts.banner += "    rename SLUG NAME\n"
+  opts.banner += "    private SLUG\n"
+  opts.banner += "    public SLUG\n"
+  opts.banner += "    search NAME\n"
+  opts.banner += "    gc-view CODE\n"
+  opts.banner += "    gc-redeem CODE\n"
+  opts.banner += "    auto-purge HOURS\n"
+  opts.banner += "\nOptions:\n"
+  
+  opts.on('-u CREDS', 'Specify credentials as USER:PASS') do |u| @options[:creds] = u end
+  opts.on('-p PAGE', Integer, 'Show page with nr. PAGE in `list` (default: 1)') do |p| @options[:page] = p if p > 0 end
+  opts.on('-n ITEMSPP', Integer, 'Show ITEMSPP items per page in `list` (default: 5)') do |n| @options[:per_page] = n if n > 0 end
+  opts.on('-t TYPE', '--type TYPE', ITEM_TYPES, 'Show only items of TYPE in `list`') do |t| @options[:type] = t end
+  opts.on('-s SOURCE', '--source SOURCE', 'Show only items from SOURCE in ´list´') do |s| @options[:source] = s end
+  opts.on('-d', '--deleted', 'Show deleted items in ´list´ too') do |d| @options[:deleted] = true end
+  opts.on('-a', '--all', 'Show all items of an account at once in `list` (overrides -p, -n)') do |a| @options[:all] = true end
+  opts.on('--private', 'Do private upload') do |priv| @options[:private] = true end
+  opts.on('--public', 'Do public upload') do |pub| @options[:public] = true end
+  opts.on('--disable-colors', 'Disables colors') do |dis| @options[:colors] = false end
+  opts.on('--service URL', 'Specify service URL') do |url| @options[:service_url] = url end
+  opts.on('-y', '--yes', 'Answer all questions with yes (useful e.g. in scripts)') do |y| @options[:yes] = true end
+  opts.on('-v', '--verbose', 'Enables verbose mode on some commands (currently view, account)') do |v| @options[:verbose] = true end
+  opts.on('-h', '-?', '--help', 'Display this screen') do
+    puts opts
+    exit
+  end
+end
+
+@opts.parse!
+
+$config_file = File.join(ENV['HOME'], '.cloudapp-cli')
+
+# HACK: inject our service url as HTTParty base_uri into
+# all subclasses of CloudApp::Base
+service_url = load_service_url
+CloudApp::Base.subclasses.each do |c|
+  c.base_uri service_url
+end
+
+case ARGV.first
+when nil
+  puts @opts
+  exit
+when 'login'
+  if ARGV[1] and ARGV[2]
+    client = CloudApp::Client.new
+    client.authenticate(ARGV[1], ARGV[2])
+    save = true
+    begin
+      CloudApp::Account.find
+    rescue => ex
+      save = false
+    end
+    if !save
+      if @options[:yes]
+        puts "Saving login though it seems incorrect."
+        save = true
+      elsif $stdin.tty?
+        print "Your new login seems to be incorrect, save anyways? (y/n): "
+        answer = $stdin.gets
+        case answer
+        when "y\n"
+          save = true
+        else
+          puts "You didn't answer with 'y', done nothing."
+        end
+      end
+    end
+    if save
+      # set
+      save_config({'username' => ARGV[1], 'password' => ARGV[2]})
+      puts 'Account login saved.'
+    end
+  else
+    # get
+    config = load_config
+    puts "Current login:"
+	puts "  Username: #{config['username']}"
+	puts "  Password: #{config['password']}"
+  end
+  exit 0
+when 'register'
+  args? 3
+  begin
+    acc = CloudApp::Account.create :email => ARGV[1], :password => ARGV[2], :accept_tos => true
+  rescue CloudApp::ResponseError => ex
+    abort "Username already registered!" if ex.code == 406
+    abort "Server rejected request because of invalid username/email or password!" if ex.code = 422
+    abort "Registration failed (#{ex.to_s}) - may be a bug"
+  rescue => ex
+    abort "Registration failed (#{ex.to_s})"
+  end
+  puts "Successfully registered!\nYour account has been activated instantly, happy clouding!" if not acc.activated_at.nil?
+  puts "Successfully registered but your account isn't currently activated." if acc.activated_at.nil?
+  if @options[:yes]
+    puts "Saving login to local login storage #{$config_file}."
+    save_config({'username' => ARGV[1], 'password' => ARGV[2]})
+  elsif $stdin.tty?
+    if File.exists?($config_file)
+      print "Do you want to overwrite your local login storage #{$config_file}? (y/n): "
+    else
+      print "Do you want to save your login to #{$config_file} for automated use? (y/n): "
+    end
+    answer = $stdin.gets
+    case answer
+    when "y\n"
+      save_config({'username' => ARGV[1], 'password' => ARGV[2]})
+      puts "Account registered and login saved."
+    else
+      puts "You didn't answer with 'y', done nothing."
+    end
+  end
+  exit 0
+when 'service'
+  if ARGV[1]
+    uri = ARGV[1]
+    uri = 'http://' + uri if URI.parse(ARGV[1]).scheme.nil?
+    if (uri =~ URI::regexp).nil?
+      puts "Your new service is not a valid URL, done nothing."
+    else
+      # set
+      save_config({'service_url' => uri})
+      puts "New service saved."
+    end
+  else
+    # get
+    puts "Current service: #{service_url}"
+  end
+  exit 0
+end
+
+config = load_config
+
+@client = CloudApp::Client.new
+
+# all following commands need authentication
+@client.authenticate(config['username'], config['password'])
+begin
+  @acc = CloudApp::Account.find
+  $domain = @acc.domain.nil? ? 'cl.ly' : @acc.domain
+rescue CloudApp::ResponseError => ex
+  abort "Incorrect login!" if ex.code == 403
+  abort "Your account hasn't been activated!" if ex.code == 409
+  abort "Authentication unexpectedly failed: #{ex.to_s}\n  #{ex.backtrace.join("\n  ")}"
+end
+
+begin
+  case ARGV.first
+  when 'list'
+    topt = {:page => 1, :per_page => 5}
+    
+    topt[:page] = @options[:page] if @options.key?(:page)
+    topt[:per_page] = @options[:per_page] if @options.key?(:per_page)
+    # HACK: 100 items should be enough for everyone!
+    topt[:page], topt[:per_page] = 1, 100 if @options[:all]
+    topt[:type] = @options[:type] if @options.key?(:type)
+    topt[:deleted] = @options[:deleted] if @options.key?(:deleted)
+    topt[:source] = @options[:source] if @options.key?(:source)
+
+    # caption
+    puts format("%-#{HASH_LENGTH}s %s", "SLUG", "p=private, d=deleted")
+
+    @client.drops(topt).each do |drop|
+      puts print_long(drop)
+    end
+
+  when 'view'
+    args?
+    drop = @client.drop ARGV[1]
+    puts "Details for #{drop.slug}:"
+    puts "  Name:     #{drop.name}"
+    puts "  Type:     #{drop.item_type}"
+    puts "  URL:      #{drop.url}"
+    puts "  Privacy:  #{drop.private ? 'private' : 'public'}"
+    puts "  Views:    #{drop.view_counter}"
+    puts "  Redirect: #{drop.redirect_url}" if !drop.redirect_url.nil?
+    puts "  Created:  #{drop.created_at.json2fmtlocaltime(VIEW_TIME_FMT)}"
+    puts "  Updated:  #{drop.updated_at.json2fmtlocaltime(VIEW_TIME_FMT)}"
+    puts "  Deleted:  #{drop.deleted_at.json2fmtlocaltime(VIEW_TIME_FMT)}" if !drop.deleted_at.nil?
+    puts "  Href:     #{drop.href}" if @options[:verbose]
+    puts "  Source:   #{drop.source}" if @options[:verbose]
+
+  when 'change'
+    args? 3
+    case ARGV[1]
+    when 'username'
+      CloudApp::Account.update :email => ARGV[2], :current_password => config['password']
+      # only update local credential storage when current creds *not* given via command line
+      if @options[:creds].nil?
+        save_config({'username' => ARGV[2]})
+        puts "Login changed, updated #{$config_file}."
+      end
+    when 'password'
+      CloudApp::Account.update :password => ARGV[2], :current_password => config['password']
+      # only update local credential storage when current creds *not* given via command line
+      if @options[:creds].nil?
+        save_config({'password' => ARGV[2]})
+        puts "Login changed, updated #{$config_file}."
+      end
+    when 'privacy'
+      CloudApp::Account.update :private_items => (ARGV[2] == 'private')
+    end
+
+  when 'account'
+    # use @acc and stats
+    stats = CloudApp::Account.stats
+    puts "Account '#{config[:username]}':"
+    puts "  ID:              #{@acc.id}"
+    puts "  Username:        #{@acc.email}"
+    puts "  Default privacy: #{@acc.private_items ? 'private' : 'public'}"
+    puts "  Subscription:    #{@acc.subscribed ? 'yes' : 'no'}" +
+      (@acc.subscribed ? " (expires: #{@acc.subscription_expires_at})" : '')
+    puts "  Domain:          #{@acc.domain}"
+    puts "  Domain homepage: #{@acc.domain_home_page}"
+    puts "  Created:         #{@acc.created_at.json2fmtlocaltime(ACC_TIME_FMT)}"
+    puts "  Updated:         #{@acc.updated_at.json2fmtlocaltime(ACC_TIME_FMT)}" if @options[:verbose]
+    puts "  Activated:       #{@acc.activated_at.json2fmtlocaltime(ACC_TIME_FMT)}" if @options[:verbose]
+    puts
+    puts "Stats:"
+    puts "  Nr. of items:       #{stats[:items]}"
+    puts "  Nr. of total views: #{stats[:views]}"
+
+  when 'upload'
+    args?
+    # TODO: Notify the user when exceeding upload limits
+    begin
+      if @options[:private]
+        drop = @client.upload ARGV[1], :private => true
+      elsif @options[:public]
+        drop = @client.upload ARGV[1], :private => false
+      else
+        drop = @client.upload ARGV[1]
+      end
+      puts "#{drop.url}"
+    rescue *LOW_ERRORS => ex
+      abort "Upload failed maybe due to too large file or server limits!"
+    end
+
+  when 'bookmark'
+    if ARGV.length == 2
+      drop = @client.bookmark ARGV[1], ARGV[1]
+      puts "Created bookmark #{drop.slug}, URL:\n#{drop.url}"
+    else
+      args? 3
+      drop = @client.bookmark ARGV[1], ARGV[2]
+      puts "Created bookmark #{drop.slug}, URL:\n#{drop.url}"
+    end
+
+  when 'private'
+    args?
+    drop = @client.privacy ARGV[1], true
+    puts "#{drop.slug} is now private"
+
+  when 'public'
+    args?
+    drop = @client.privacy ARGV[1], false
+    puts "#{drop.slug} is now public"
+
+  when 'delete','remove'
+    args?
+    drop = @client.delete ARGV[1]
+    puts "Moved #{drop.slug} into trash"
+
+  when 'recover'
+    args?
+    drop = @client.recover ARGV[1]
+    puts "Recovered #{drop.slug} from trash"
+
+  when 'rename'
+    args? 3
+    drop = @client.rename ARGV[1], ARGV[2]
+    puts "#{ARGV[1]} renamed to #{ARGV[2]}"
+
+  when 'download'
+    args?
+    drop = @client.drop ARGV[1]
+    if drop.item_type == 'bookmark'
+      abort "Cannot download bookmarks!"
+    end
+    # File name filtering - this build up from a union of NTFS, FAT, HFS, ext3
+    file_name = drop.name.gsub(/[\x00\/\\:\*\?\"<>\|\^]/, '_')
+    if File.exists?(file_name)
+      abort "Target file '#{file_name}' already exists! Canceling..."
+    end
+    res = fetch(drop.content_url)
+    File.open(file_name, 'w') do |file|
+      file.write(res.body)
+    end
+    puts "Downloaded #{drop.slug} as '#{file_name}'."
+  
+  when 'search'
+    args?
+    @client.drops({:page => 1, :per_page => 100}).each do |drop|
+      # check drop.name and drop.redirect_url
+      if drop.name.match(ARGV[1]) or (!drop.redirect_url.nil? and drop.redirect_url.match(ARGV[1]))
+        puts print_long(drop)
+      end
+    end
+  
+  when 'gc-view'
+    args?
+    gift = CloudApp::GiftCard.find ARGV[1]
+    puts "Details for gift card #{gift.code}:"
+    puts "  ID:        #{gift.id}"
+    puts "  Plan:      #{gift.plan}"
+    puts "  Months:    #{gift.months}"
+    puts "  Href:      #{gift.href}"
+    puts "  Created:   #{gift.created_at.json2fmtlocaltime(VIEW_TIME_FMT)}"
+    puts "  Updated:   #{gift.updated_at.json2fmtlocaltime(VIEW_TIME_FMT)}" if @options[:verbose]
+    puts "  Redeemed:  #{gift.redeemed_at.json2fmtlocaltime(VIEW_TIME_FMT)}" if !gift.redeemed_at.nil?
+    puts "  Effective: #{gift.effective_at.json2fmtlocaltime(VIEW_TIME_FMT)}" if !gift.effective_at.nil?
+    puts "  Expires:   #{gift.expires_at.json2fmtlocaltime(VIEW_TIME_FMT)}" if !gift.expires_at.nil?
+
+  when 'gc-redeem'
+    args?
+    gift = CloudApp::GiftCard.redeem ARGV[1]
+    puts "Redeemed gift card #{gift.code}"
+  
+  when 'auto-purge'
+    args?
+    hours = ARGV[1].to_i
+    abort "Hours given are negative" if hours < 0
+    puts "Request to delete all items created more than #{hours} hours ago from now"
+    latest = Time.now - hours*60*60
+    @client.drops({:page => 1, :per_page => 1000}).each do |drop|
+      if drop.created_at.localtime < latest
+        puts "Deleting #{drop.slug}"
+        @client.delete drop.slug
+      end
+    end
+    puts "Done"
+  
+  else
+    puts @opts
+    abort "Unknown command!"
+  end
+rescue CloudApp::ResponseError => ex
+  abort "Item not found!" if ex.code == 404
+  abort "File too large! (#{ex.to_s})" if ex.code == 413
+  abort "Your account hasn't been activated!" if ex.code == 409
+  abort "#{ARGV.first} unexpectedly failed: #{ex.to_s}\n  #{ex.backtrace.join("\n  ")}"
+end
