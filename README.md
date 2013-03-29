@@ -1,8 +1,8 @@
 # cloudapp-power-cli
 
-A powerful CLI for [CloudApp](http://getcloudapp.com/) written in Ruby, formerly named *cloudapp-cli* that makes the complete CloudApp API available on command line.
+[![works with regenwolken](http://mycrobase.de/wtf/works_with_regenwolken.png)](https://github.com/posativ/regenwolken)
 
-**[Works with regenwolken](https://github.com/posativ/regenwolken)**
+A powerful CLI for [CloudApp](http://getcloudapp.com/) written in Ruby, formerly named *cloudapp-cli* that makes the complete CloudApp API available on command line.
 
 ## Installation
 
