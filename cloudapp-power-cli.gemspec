@@ -1,7 +1,11 @@
 
+$:.push File.expand_path("../lib", __FILE__)
+
+require 'cloudapp-power-cli/version'
+
 Gem::Specification.new do |s|
   s.name = "cloudapp-power-cli"
-  s.version = "1.0.0"
+  s.version = CloudAppPowerCLI::VERSION
   s.summary = "A powerful CLI for CloudApp written in Ruby."
   s.description = "A powerful CLI for CloudApp that makes the complete CloudApp API available on command line and works with Regenwolken."
   s.author = "Christian Nicolai"

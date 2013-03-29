@@ -6,8 +6,9 @@ require 'optparse'
 require 'uri'
 require 'yaml'
 
-require 'rubygems'
 require 'cloudapp_api'
+
+require 'cloudapp-power-cli/version'
 
 LIST_TIME_FMT = '%d.%m.%y %H:%M'
 VIEW_TIME_FMT = '%d. %b %Y %H:%M:%S'
@@ -184,6 +185,10 @@ end
   opts.on('--service URL', 'Specify service URL') do |url| @options[:service_url] = url end
   opts.on('-y', '--yes', 'Answer all questions with yes (useful e.g. in scripts)') do |y| @options[:yes] = true end
   opts.on('-v', '--verbose', 'Enables verbose mode on some commands (currently view, account)') do |v| @options[:verbose] = true end
+  opts.on('--version', 'Display version') do
+  	puts CloudAppPowerCLI::VERSION
+  	exit
+  end
   opts.on('-h', '-?', '--help', 'Display this screen') do
     puts opts
     exit
